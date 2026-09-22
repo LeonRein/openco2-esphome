@@ -29,6 +29,11 @@ substitutions:
   # waiting for its first reading before it can sleep again.
   sensor_interval: 5s
   display_interval: 30s # e-paper refresh while on the power adapter
+  # How many refreshes between full (flashing) ones. Everything in between is a
+  # partial update, which redraws without the black/white inversion. 30 full
+  # updates apart = one flash per 15 min at a 30 s interval. Lower it if
+  # ghosting builds up; raise it if the flashing still bothers you.
+  full_update_every: "30"
   low_battery_volts: "3.30" # below this the sensor parks itself to protect the cell
 
 esphome:
@@ -177,7 +182,12 @@ sensor:
     # compensate humidity, so a mid-range value keeps RH sane in both modes.
     # The mode-specific part is corrected in the filter below.
     temperature_offset: 4.4
-    automatic_self_calibration: true
+    # OFF on purpose. ASC re-baselines on the lowest reading it has seen,
+    # assuming the sensor meets fresh air regularly. This one lives in a room
+    # that often goes >24 h without airing out, so ASC would corrupt the
+    # baseline and overwrite the manual calibration. Recalibrate outdoors
+    # with the "Calibrate to 420 ppm" button every few months instead.
+    automatic_self_calibration: false
     co2:
       name: CO2
       id: co2
@@ -367,7 +377,9 @@ display:
     # power-on reset and the panel never releases BUSY.
     rotation: 270°
     update_interval: never # updated from the sensor automation
-    full_update_every: 1
+    # Was 1 (copied from the community config), which forced a full flashing
+    # refresh on every single update. The SSD1681 supports partial updates.
+    full_update_every: ${full_update_every}
     lambda: |-
       // ---- top row: temperature | humidity ----
       if (id(temp).has_state())
