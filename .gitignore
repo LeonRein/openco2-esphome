@@ -1,0 +1,5 @@
+.esphome/
+.venv/
+secrets.yaml
+__pycache__/
+stock-openco2-*.bin

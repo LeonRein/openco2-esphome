@@ -1,0 +1,399 @@
+# ESPHome firmware for the OpenCO2 Sensor
+# https://github.com/davidkreidler/OpenCO2_Sensor  (ESP32-S2 + SCD4x + 1.54" e-paper)
+#
+# Pin map taken from the stock Arduino firmware (v6.2):
+#   DISPLAY_POWER    GPIO45      e-paper panel power rail
+#   LED_POWER        GPIO9       RGB LED power rail
+#   LED_PIN          GPIO39      WS2812 data (HW rev 3)
+#   USB_PRESENT      GPIO4       high = power adapter, low = battery
+#   BATTERY_VOLTAGE  GPIO5       ADC, 1:2 divider
+#   BUTTON           GPIO0       menu button, active low
+#   DISABLE_CHARGING GPIO10
+#   e-paper SPI      CLK 41, MOSI 21, CS 42, DC 8, BUSY 6, RST 7
+#   I2C (SCD4x)      HW rev 3: SDA 3 / SCL 2   |   HW rev 1-2: SDA 33 / SCL 34
+
+substitutions:
+  device_name: openco2
+  friendly_name: OpenCO2 Sensor
+
+  # ---- Hardware revision -------------------------------------------------
+  # Recent boards (HWSubRev 3) use I2C 3/2 and a WS2812 LED on GPIO39.
+  # Older boards (HWSubRev 1-2) use I2C 33/34 and an APA102 (data 40, clk 39).
+  # If the i2c scan in the log finds nothing at 0x62, switch to 33/34.
+  i2c_sda: GPIO3
+  i2c_scl: GPIO2
+
+  # ---- Behaviour ---------------------------------------------------------
+  battery_sleep: 5min # deep-sleep cycle when running on battery
+  # Poll the SCD4x fast: on battery this is how long the sensor stays awake
+  # waiting for its first reading before it can sleep again.
+  sensor_interval: 5s
+  display_interval: 30s # e-paper refresh while on the power adapter
+  low_battery_volts: "3.30" # below this the sensor parks itself to protect the cell
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # Bring the e-paper rail up before the display component talks to the panel.
+    - priority: 800
+      then:
+        - switch.turn_on: epd_power
+    # Decide battery vs. adapter behaviour once all pins have been read.
+    - priority: -100
+      then:
+        - script.execute: apply_power_mode
+  on_shutdown:
+    # Runs before deep sleep: park the LED cleanly, then cut its rail.
+    priority: 700
+    then:
+      - light.turn_off: led
+      - delay: 50ms
+      - switch.turn_off: led_power
+
+esp32:
+  board: esp32-s2-saola-1
+  framework:
+    type: esp-idf
+
+# Logs go over the native USB port (the S2 has no USB-serial bridge).
+logger:
+  level: INFO
+  hardware_uart: USB_CDC
+
+# reboot_timeout: 0s is what makes the sensor usable away from home - without it
+# ESPHome reboots every 15 min when it cannot reach Wi-Fi or Home Assistant.
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Wi-Fi stays off until the power adapter is plugged in (see apply_power_mode).
+  enable_on_boot: false
+  reboot_timeout: 0s
+  power_save_mode: HIGH
+  fast_connect: true
+
+deep_sleep:
+  id: sleeper
+  sleep_duration: ${battery_sleep}
+  # Plugging in the power adapter pulls GPIO4 high and wakes the sensor at once.
+  # (ext1 keeps the RTC peripherals powered down, unlike a button/ext0 wake.)
+  esp32_ext1_wakeup:
+    pins:
+      - pin:
+          number: GPIO4
+          allow_other_uses: true # also read as a binary_sensor
+    mode: ANY_HIGH
+
+globals:
+  - id: low_battery
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+i2c:
+  id: bus_a
+  sda: ${i2c_sda}
+  scl: ${i2c_scl}
+  scan: true # set to false once 0x62 shows up in the log
+
+spi:
+  - id: disp_spi
+    clk_pin: GPIO41
+    mosi_pin: GPIO21
+
+switch:
+  - platform: gpio
+    id: epd_power
+    pin: GPIO45
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  - platform: gpio
+    id: led_power
+    # HW rev 3: active high. On HW rev 1-2 add `inverted: true`.
+    pin: GPIO9
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  # Stock firmware keeps the LED off on battery; this switch lets you override.
+  - platform: template
+    id: led_enabled
+    name: LED
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_off:
+      - light.turn_off: led
+      - delay: 50ms
+      - switch.turn_off: led_power
+
+  - platform: gpio
+    id: disable_charging
+    name: Disable charging
+    pin: GPIO10
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+
+binary_sensor:
+  # ---- the battery / power-adapter distinction ----
+  - platform: gpio
+    id: usb_power
+    name: Power adapter
+    pin:
+      number: GPIO4
+      allow_other_uses: true # also the ext1 deep-sleep wake source
+    device_class: plug
+    on_press:
+      - script.execute: apply_power_mode
+    on_release:
+      - script.execute: apply_power_mode
+
+  - platform: gpio
+    id: menu_button
+    name: Button
+    pin:
+      number: GPIO0
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    on_press:
+      - component.update: epd
+
+sensor:
+  - platform: scd4x
+    i2c_id: bus_a
+    id: scd
+    measurement_mode: periodic
+    update_interval: ${sensor_interval}
+    altitude_compensation: 50m
+    # Chip-side offset. Kept at 4.4 K because the SCD4x also uses it to
+    # compensate humidity, so a mid-range value keeps RH sane in both modes.
+    # The mode-specific part is corrected in the filter below.
+    temperature_offset: 4.4
+    automatic_self_calibration: true
+    co2:
+      name: CO2
+      id: co2
+    temperature:
+      name: Temperature
+      id: temp
+      filters:
+        # Stock firmware self-heating compensation: 12.2 K on adapter+Wi-Fi,
+        # 0 K on battery. The chip already took 4.4 K off, so adjust the rest.
+        - lambda: |-
+            return id(usb_power).state ? (x - 7.8f) : (x + 4.4f);
+    humidity:
+      name: Humidity
+      id: rh
+      # Humidity is published last, so the whole set is fresh here.
+      on_value:
+        - if:
+            condition:
+              binary_sensor.is_off: usb_power
+            then:
+              # Battery: draw once and sleep straight away.
+              - component.update: epd
+              - delay: 4s # let the panel finish its refresh
+              - deep_sleep.enter: sleeper
+
+  - platform: adc
+    id: batt_v
+    pin: GPIO5
+    name: Battery voltage
+    attenuation: 12db
+    samples: 4
+    update_interval: 60s
+    unit_of_measurement: V
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    filters:
+      - multiply: 2.0 # 1:2 divider on the board
+    on_value_range:
+      - below: ${low_battery_volts}
+        then:
+          - lambda: id(low_battery) = true;
+          - component.update: epd
+          - delay: 5s
+          - if:
+              condition:
+                binary_sensor.is_off: usb_power
+              then:
+                # Park for 12 h. Plugging in the adapter wakes it immediately.
+                - deep_sleep.enter:
+                    id: sleeper
+                    sleep_duration: 12h
+
+  - platform: template
+    id: batt_pct
+    name: Battery
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      float v = id(batt_v).state;
+      if (std::isnan(v)) return {};
+      if (v <= 3.30f) return 0.0f;
+      if (v >= 4.15f) return 100.0f;
+      // Coarse LiPo curve: 3.30-3.70 V covers the bottom half.
+      if (v < 3.70f) return (v - 3.30f) / 0.40f * 50.0f;
+      return 50.0f + (v - 3.70f) / 0.45f * 50.0f;
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: ip_addr
+      internal: true
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led
+    name: Status LED
+    pin: GPIO39
+    num_leds: 1
+    chipset: WS2812
+    channel_colors: GRB
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+
+interval:
+  # The panel is only redrawn this often on the adapter; on battery the sensor
+  # draws once per wake instead (see the humidity on_value above).
+  - interval: ${display_interval}
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: usb_power
+          then:
+            - component.update: epd
+
+  # Traffic-light colour, adapter only - the LED is the biggest battery drain.
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            and:
+              - binary_sensor.is_on: usb_power
+              - switch.is_on: led_enabled
+              - lambda: return id(co2).has_state();
+          then:
+            - script.execute: update_led
+
+script:
+  - id: apply_power_mode
+    mode: restart
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: usb_power
+          then:
+            - deep_sleep.prevent: sleeper
+            - wifi.enable:
+            - if:
+                condition:
+                  switch.is_on: led_enabled
+                then:
+                  - switch.turn_on: led_power
+          else:
+            - light.turn_off: led
+            - delay: 50ms
+            - switch.turn_off: led_power
+            - wifi.disable:
+            - deep_sleep.allow: sleeper
+
+  - id: update_led
+    then:
+      - switch.turn_on: led_power
+      - lambda: |-
+          // Colour ramp copied from the stock firmware.
+          int ppm = (int) id(co2).state;
+          int red = 0, green = 0, blue = 0;
+          if (ppm > 2000) {
+            red = 216; green = 2; blue = 131;          // magenta
+          } else {
+            red   = (int) (std::pow(ppm - 400, 2) / 10000.0);
+            green = (int) (-std::pow(ppm - 400, 2) / 4500.0 + 255.0);
+            red   = std::max(0, std::min(255, red));
+            green = std::max(0, std::min(255, green));
+          }
+          auto call = id(led).turn_on();
+          call.set_rgb(red / 255.0f, green / 255.0f, blue / 255.0f);
+          call.set_brightness(0.15f);   // stock default is dim
+          call.set_transition_length(0);
+          call.perform();
+
+button:
+  - platform: template
+    name: Calibrate to 420 ppm
+    entity_category: config
+    on_press:
+      # Only run this outdoors, after 3+ minutes of fresh air.
+      - scd4x.perform_forced_calibration:
+          id: scd
+          value: 420
+
+font:
+  - file: fonts/DejaVuSansCondensed-Bold.ttf
+    id: font_big
+    size: 76
+    glyphs: "0123456789-"
+  - file: fonts/DejaVuSansCondensed-Bold.ttf
+    id: font_med
+    size: 26
+    glyphs: "0123456789.°C%rHpm"
+  - file: fonts/DejaVuSansCondensed.ttf
+    id: font_small
+    size: 14
+    glyphs: "0123456789.% USBATERYMPV"
+
+display:
+  - platform: waveshare_epaper
+    id: epd
+    spi_id: disp_spi
+    model: 1.54inv2 # 200x200, SSD1681
+    cs_pin: GPIO42
+    dc_pin: GPIO8
+    busy_pin: GPIO6
+    reset_pin: GPIO7
+    # No reset_duration override: ESPHome's 200 ms default matches Waveshare's
+    # own driver. The 2 ms the community configs use starves the SSD1681's
+    # power-on reset and the panel never releases BUSY.
+    rotation: 270°
+    update_interval: never # updated from the sensor automation
+    full_update_every: 1
+    lambda: |-
+      // ---- top row: temperature | humidity ----
+      if (id(temp).has_state())
+        it.printf(2, 0, id(font_med), TextAlign::TOP_LEFT, "%.1f°C", id(temp).state);
+      if (id(rh).has_state())
+        it.printf(198, 0, id(font_med), TextAlign::TOP_RIGHT, "%.0f%%rH", id(rh).state);
+      it.line(0, 34, 200, 34);
+
+      // ---- centre: CO2 ----
+      if (id(co2).has_state())
+        it.printf(100, 38, id(font_big), TextAlign::TOP_CENTER, "%.0f", id(co2).state);
+      else
+        it.printf(100, 38, id(font_big), TextAlign::TOP_CENTER, "---");
+      it.printf(100, 128, id(font_med), TextAlign::TOP_CENTER, "ppm");
+
+      // ---- bottom row: power source + battery ----
+      // Drawn as a SINGLE printf: two separate printf calls made the label and
+      // the value look mismatched in size/baseline on the panel.
+      it.line(0, 166, 200, 166);
+      float pct = id(batt_pct).has_state() ? id(batt_pct).state : 0.0f;
+      if (id(low_battery)) {
+        it.printf(100, 172, id(font_small), TextAlign::TOP_CENTER, "BATTERY EMPTY");
+      } else if (id(usb_power).state) {
+        it.printf(2, 172, id(font_small), TextAlign::TOP_LEFT, "USB %.0f%% %s",
+                  pct, id(ip_addr).state.c_str());
+      } else {
+        it.printf(2, 172, id(font_small), TextAlign::TOP_LEFT, "BAT %.0f%% %.2fV",
+                  pct, id(batt_v).has_state() ? id(batt_v).state : 0.0f);
+      }
