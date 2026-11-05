@@ -92,11 +92,13 @@ add `inverted: true` to the `led_power` switch, and swap the light for
 
 | | Power adapter | Battery |
 |---|---|---|
-| Wi-Fi | on | **off** (`wifi.disable`) |
+| Wi-Fi | on; off again after 2 min without a network, retried every 30 min | **off** (`wifi.disable`) |
 | Sleep | never (`deep_sleep.prevent`) | deep sleep, wakes every `battery_sleep` (5 min) |
 | Display | refreshed every 30 s | refreshed once per wake |
 | LED | CO2 traffic light | off |
-| Temp offset | 12.2 K | 0 K |
+| Temp offset | 12.2 K with Wi-Fi connected, 4.4 K without | 0 K |
+| SCD4x between readings | measuring every 5 s | stopped (idle) during deep sleep |
+| Charging | stops above 4.0 V, resumes below 3.9 V (stock default) | — |
 
 The SCD4x is polled every 5 s in both modes. That interval sets how long the sensor
 has to stay awake on battery waiting for its first reading, so a slow poll is
@@ -116,16 +118,40 @@ separate left/right-aligned calls made them look mismatched in size on the panel
 
 ## Temperature offset
 
-The board self-heats, so the reading needs compensating. The stock firmware uses
-12.2 K on adapter+Wi-Fi, 4.4 K on adapter alone and 0 K on battery. Since Wi-Fi here
-is on exactly when the adapter is, a lambda filter on the temperature sensor applies
-12.2 K or 0 K to match. The chip-side `temperature_offset` stays at 4.4 K because the
-SCD4x also uses it to compensate humidity.
+The SCD4x shares a small board with the ESP32-S2, the charger and the LED, so it
+reads warm. The stock firmware (`getTempOffset()`, v6.3) subtracts:
 
-If the reading is consistently off against a reference thermometer, adjust the
-constants in that filter. Give it ~20 min to settle thermally first — it drifts for a
-while after a reboot. `esp32: cpu_frequency: 80MHz` is the other lever: less heat to
-compensate for, and less battery burnt.
+| Mode | Offset |
+|---|---|
+| power adapter, Wi-Fi on | 12.2 K |
+| power adapter, no Wi-Fi | 4.4 K |
+| battery (single-shot, sensor powered down in between) | 0.0 K |
+
+This config uses the same three values, picked at runtime from the `Power adapter`
+sensor and whether Wi-Fi is connected. Away from home (no known network) the radio
+switches itself off after `wifi_give_up` (2 min) and only retries every `wifi_retry`
+(30 min), so the 4.4 K case is what actually applies there.
+
+Those offsets were measured on hardware that behaved in specific ways, and this
+config now matches them:
+
+- **CPU at 80 MHz** (`esp32: cpu_frequency: 80MHZ`), like the stock build. ESPHome's
+  default for the S2 is 240 MHz, which heats the board noticeably more — the main
+  reason readings were too high before.
+- **SCD4x stopped before deep sleep** on battery. Left in periodic mode it draws
+  ~15 mA for the whole sleep and warms itself.
+- **Chip-side `temperature_offset: 0`**, all compensation in software. The SCD4x
+  computes RH relative to its own temperature, so the humidity filter rescales it to
+  the corrected temperature (Magnus formula). With a fixed chip offset RH was badly
+  off whenever the real offset differed from it.
+
+The stock firmware also light-sleeps the ESP between measurements on the adapter
+without Wi-Fi, which ESPHome cannot do while running; the 4.4 K may therefore come
+out a little low. Each offset is a number entity (`Temperature offset ...`) you can
+tune against a reference thermometer after the sensor has sat in that mode for an
+hour (it needs that long to warm up / cool down). If it reads 1.5 K too high, raise
+that offset by 1.5. Values set there are stored on the device and take precedence
+over the `temp_offset_*` substitutions from then on.
 
 GPIO4 is both the `Power adapter` binary sensor and the ext1 deep-sleep wake source,
 so plugging in the adapter wakes the sensor immediately instead of waiting out the

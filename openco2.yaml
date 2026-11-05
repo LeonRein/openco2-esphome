@@ -36,6 +36,29 @@ substitutions:
   full_update_every: "30"
   low_battery_volts: "3.30" # below this the sensor parks itself to protect the cell
 
+  # ---- Temperature compensation ------------------------------------------
+  # The SCD4x sits on the same small board as the ESP32-S2, the charger and
+  # the LED, so it reads warm. These are subtracted from the raw reading.
+  # Defaults are the stock firmware's values (getTempOffset(), v6.3):
+  #   power adapter, Wi-Fi connected:  12.2 K
+  #   power adapter, no Wi-Fi:          4.4 K
+  #   battery:                          0.0 K  (sensor idle between readings)
+  # They are only the start values: each is also a number entity
+  # ("Temperature offset ...") that can be tuned from Home Assistant without
+  # reflashing. A value set there is stored on the device and wins over
+  # these defaults from then on.
+  temp_offset_wifi: "12.2"
+  temp_offset_usb: "4.4"
+  temp_offset_battery: "0.0"
+
+  # ---- Wi-Fi away from home ----------------------------------------------
+  # On the adapter Wi-Fi is switched on, but if no network is found within
+  # wifi_give_up the radio is switched off again (endless scanning heats the
+  # board and the "no Wi-Fi" offset would be wrong). Every wifi_retry it
+  # tries once more, so it reconnects on its own when you are back home.
+  wifi_give_up: 2min
+  wifi_retry: 30min
+
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
@@ -52,12 +75,23 @@ esphome:
     # Runs before deep sleep: park the LED cleanly, then cut its rail.
     priority: 700
     then:
+      # Stop the SCD4x's periodic measurement so it idles while the ESP
+      # sleeps. Left running it draws ~15 mA for the whole 5 min and warms
+      # itself, which the stock firmware avoids with single-shot readings
+      # (its battery offset is 0.0 only because of that). ESPHome restarts
+      # the measurement in its setup on the next wake.
+      - lambda: id(scd).write_command((uint16_t) 0x3f86);
       - light.turn_off: led
       - delay: 50ms
       - switch.turn_off: led_power
 
 esp32:
   board: esp32-s2-saola-1
+  # ESPHome defaults the S2 to 240 MHz. The stock firmware is built at 80 MHz
+  # (its README and CI both say so), and its 12.2 K adapter offset was
+  # measured that way - at 240 MHz the chip heats the CO2 sensor noticeably
+  # more and every reading ends up too high.
+  cpu_frequency: 80MHZ
   framework:
     type: esp-idf
 
@@ -76,6 +110,7 @@ ota:
     password: !secret ota_password
 
 wifi:
+  id: wifi_comp
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   # Wi-Fi stays off until the power adapter is plugged in (see apply_power_mode).
@@ -145,6 +180,18 @@ switch:
     restore_mode: ALWAYS_OFF
     entity_category: config
 
+  # Stock default (limitMaxBattery): stop charging above 4.0 V, resume below
+  # 3.9 V. Easier on the LiPo, and no charger heat next to the sensor once
+  # it sits on the adapter all day. Driven from the battery voltage sensor.
+  - platform: template
+    id: charge_limit
+    name: Limit charge to 4.0 V
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    on_turn_off:
+      - switch.turn_off: disable_charging
+
 binary_sensor:
   # ---- the battery / power-adapter distinction ----
   - platform: gpio
@@ -178,10 +225,11 @@ sensor:
     measurement_mode: periodic
     update_interval: ${sensor_interval}
     altitude_compensation: 50m
-    # Chip-side offset. Kept at 4.4 K because the SCD4x also uses it to
-    # compensate humidity, so a mid-range value keeps RH sane in both modes.
-    # The mode-specific part is corrected in the filter below.
-    temperature_offset: 4.4
+    # No chip-side offset. The stock firmware switches it on the chip per
+    # mode, which ESPHome cannot do at runtime, so the whole correction -
+    # temperature AND the humidity that depends on it - happens in the
+    # filters below. (A fixed 4.4 K here left RH far too low on the adapter.)
+    temperature_offset: 0
     # OFF on purpose. ASC re-baselines on the lowest reading it has seen,
     # assuming the sensor meets fresh air regularly. This one lives in a room
     # that often goes >24 h without airing out, so ASC would corrupt the
@@ -195,13 +243,27 @@ sensor:
       name: Temperature
       id: temp
       filters:
-        # Stock firmware self-heating compensation: 12.2 K on adapter+Wi-Fi,
-        # 0 K on battery. The chip already took 4.4 K off, so adjust the rest.
+        # Self-heating compensation, per power mode (see substitutions).
         - lambda: |-
-            return id(usb_power).state ? (x - 7.8f) : (x + 4.4f);
+            float off;
+            if (!id(usb_power).state)               off = id(temp_offset_battery).state;
+            else if (id(wifi_comp).is_connected())  off = id(temp_offset_wifi).state;
+            else                                    off = id(temp_offset_usb).state;
+            return x - off;
     humidity:
       name: Humidity
       id: rh
+      filters:
+        # The SCD4x reports RH relative to its own (warm) temperature. Same
+        # absolute humidity at the corrected temperature means a higher RH:
+        #   RH = RH_raw * e_s(T_raw) / e_s(T)   (Magnus, Sensirion constants)
+        # Temperature is published before humidity, so both are current.
+        - lambda: |-
+            float t_raw = id(temp).get_raw_state();
+            float t = id(temp).state;
+            if (std::isnan(t_raw) || std::isnan(t)) return x;
+            auto es = [](float c) { return std::exp(17.62f * c / (243.12f + c)); };
+            return std::min(100.0f, std::max(0.0f, x * es(t_raw) / es(t)));
       # Humidity is published last, so the whole set is fresh here.
       on_value:
         - if:
@@ -225,6 +287,21 @@ sensor:
     entity_category: diagnostic
     filters:
       - multiply: 2.0 # 1:2 divider on the board
+    on_value:
+      # Charge limit, same hysteresis as the stock updateCharging(): it has
+      # to read above 4.0 V a few times in a row before charging stops.
+      - lambda: |-
+          static int high_count = 0;
+          if (!id(usb_power).state || !id(charge_limit).state) {
+            high_count = 0;
+            return;
+          }
+          if (x > 4.0f) {
+            if (++high_count >= 3) id(disable_charging).turn_on();
+          } else if (x < 3.9f) {
+            high_count = 0;
+            id(disable_charging).turn_off();
+          }
     on_value_range:
       - below: ${low_battery_volts}
         then:
@@ -284,6 +361,20 @@ interval:
           then:
             - component.update: epd
 
+  # On the adapter without a connection: give Wi-Fi another short chance.
+  # Also catches a connection that dropped while the device was running.
+  - interval: ${wifi_retry}
+    then:
+      - if:
+          condition:
+            and:
+              - binary_sensor.is_on: usb_power
+              - not:
+                  wifi.connected:
+          then:
+            - wifi.enable:
+            - script.execute: wifi_give_up
+
   # Traffic-light colour, adapter only - the LED is the biggest battery drain.
   - interval: 15s
     then:
@@ -306,6 +397,7 @@ script:
           then:
             - deep_sleep.prevent: sleeper
             - wifi.enable:
+            - script.execute: wifi_give_up
             - if:
                 condition:
                   switch.is_on: led_enabled
@@ -317,6 +409,21 @@ script:
             - switch.turn_off: led_power
             - wifi.disable:
             - deep_sleep.allow: sleeper
+
+  # Switch the radio off again if no network shows up (e.g. at the office).
+  - id: wifi_give_up
+    mode: restart
+    then:
+      - delay: ${wifi_give_up}
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - logger.log:
+                level: INFO
+                format: "No Wi-Fi found, radio off until the next retry"
+            - wifi.disable:
 
   - id: update_led
     then:
@@ -338,6 +445,50 @@ script:
           call.set_brightness(0.15f);   // stock default is dim
           call.set_transition_length(0);
           call.perform();
+
+number:
+  # Tune these against a reference thermometer placed next to the sensor,
+  # after the device has been in that mode for at least an hour (it takes a
+  # while to warm up on the adapter and to cool down after unplugging).
+  # If it reads 1.5 K too high, raise the offset for that mode by 1.5.
+  - platform: template
+    id: temp_offset_wifi
+    name: Temperature offset adapter Wi-Fi
+    unit_of_measurement: K
+    entity_category: config
+    mode: box
+    min_value: -5
+    max_value: 25
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: ${temp_offset_wifi}
+
+  - platform: template
+    id: temp_offset_usb
+    name: Temperature offset adapter no Wi-Fi
+    unit_of_measurement: K
+    entity_category: config
+    mode: box
+    min_value: -5
+    max_value: 25
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: ${temp_offset_usb}
+
+  - platform: template
+    id: temp_offset_battery
+    name: Temperature offset battery
+    unit_of_measurement: K
+    entity_category: config
+    mode: box
+    min_value: -5
+    max_value: 25
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: ${temp_offset_battery}
 
 button:
   - platform: template
@@ -361,7 +512,7 @@ font:
   - file: fonts/DejaVuSansCondensed.ttf
     id: font_small
     size: 14
-    glyphs: "0123456789.% USBATERYMPV"
+    glyphs: "0123456789.% USBATERYMPVNOWIF-"
 
 display:
   - platform: waveshare_epaper
@@ -404,7 +555,7 @@ display:
         it.printf(100, 172, id(font_small), TextAlign::TOP_CENTER, "BATTERY EMPTY");
       } else if (id(usb_power).state) {
         it.printf(2, 172, id(font_small), TextAlign::TOP_LEFT, "USB %.0f%% %s",
-                  pct, id(ip_addr).state.c_str());
+                  pct, id(wifi_comp).is_connected() ? id(ip_addr).state.c_str() : "NO WI-FI");
       } else {
         it.printf(2, 172, id(font_small), TextAlign::TOP_LEFT, "BAT %.0f%% %.2fV",
                   pct, id(batt_v).has_state() ? id(batt_v).state : 0.0f);
