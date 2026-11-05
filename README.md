@@ -62,6 +62,18 @@ button dance above is usually unnecessary. Once Wi-Fi works, update over the air
 uvx esphome@latest run openco2.yaml --device openco2.local
 ```
 
+## Flashing a prebuilt image from a browser
+
+`.esphome/build/openco2/build/firmware.factory.bin` (written by `compile`) holds
+bootloader, partition table and app, and goes to **offset 0**. It can be flashed from
+[ESPHome Web](https://web.esphome.io) in Chrome/Edge: enter the ROM bootloader (see
+above), *Connect*, *Install*, pick the file. Afterwards toggle the power switch so the
+firmware starts, *Connect* again (the port changes) and use *Configure Wi-Fi*:
+`improv_serial` stores the credentials on the device, so the image itself can be built
+with the placeholder `secrets.yaml`. Do this within 2 minutes of power-up, before the
+Wi-Fi give-up switches the radio off. An image built that way has the OTA password
+from `secrets.yaml.example` (`CHANGE_ME`); use the same one for the first OTA update.
+
 ## Hardware revisions — check this first
 
 The board changed pins between revisions, and the two community configs

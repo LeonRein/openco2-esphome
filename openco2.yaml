@@ -105,6 +105,12 @@ logger:
 api:
   reboot_timeout: 0s
 
+# Lets a web flasher (web.esphome.io) set the Wi-Fi credentials over USB after
+# flashing, so a prebuilt image needs none baked in. Credentials set this way
+# are stored on the device and take precedence over secrets.yaml. Only works
+# while Wi-Fi is on, i.e. within wifi_give_up of plugging in the adapter.
+improv_serial:
+
 ota:
   - platform: esphome
     password: !secret ota_password
