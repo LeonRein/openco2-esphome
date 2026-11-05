@@ -29,11 +29,10 @@ substitutions:
   # waiting for its first reading before it can sleep again.
   sensor_interval: 5s
   display_interval: 30s # e-paper refresh while on the power adapter
-  # How many refreshes between full (flashing) ones. Everything in between is a
-  # partial update, which redraws without the black/white inversion. 30 full
-  # updates apart = one flash per 15 min at a 30 s interval. Lower it if
-  # ghosting builds up; raise it if the flashing still bothers you.
-  full_update_every: "30"
+  # A full (flashing) e-paper refresh at most this often, in both modes.
+  # Everything in between is a partial refresh. Lower it if ghosting builds
+  # up; the "Display full refresh" button forces one in between.
+  full_update_interval: 2h
   low_battery_volts: "3.30" # below this the sensor parks itself to protect the cell
 
   # ---- Temperature compensation ------------------------------------------
@@ -58,6 +57,14 @@ substitutions:
   # tries once more, so it reconnects on its own when you are back home.
   wifi_give_up: 2min
   wifi_retry: 30min
+
+# Own e-paper driver (components/openco2_epaper): keeps the last image so
+# partial refreshes work after the panel slept or the ESP was in deep sleep.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [openco2_epaper]
 
 esphome:
   name: ${device_name}
@@ -278,7 +285,9 @@ sensor:
             then:
               # Battery: draw once and sleep straight away.
               - component.update: epd
-              - delay: 4s # let the panel finish its refresh
+              # The display driver blocks until the refresh is done, so
+              # only a short grace period is needed here.
+              - delay: 200ms
               - deep_sleep.enter: sleeper
 
   - platform: adc
@@ -498,6 +507,13 @@ number:
 
 button:
   - platform: template
+    name: Display full refresh
+    entity_category: config
+    on_press:
+      - lambda: id(epd).request_full_update();
+      - component.update: epd
+
+  - platform: template
     name: Calibrate to 420 ppm
     entity_category: config
     on_press:
@@ -521,22 +537,22 @@ font:
     glyphs: "0123456789.% USBATERYMPVNOWIF-"
 
 display:
-  - platform: waveshare_epaper
+  # 1.54" 200x200 SSD1681. ESPHome's waveshare_epaper (model 1.54inv2) resets
+  # the panel before every refresh and then only writes the new image, so the
+  # controller has no "previous" image to diff against and partial refreshes
+  # leave the old content behind. This driver keeps the last image in RTC
+  # memory (survives deep sleep) and writes it back first, like the stock
+  # firmware's writePrevImage(). Init and waveforms are the stock firmware's.
+  - platform: openco2_epaper
     id: epd
     spi_id: disp_spi
-    model: 1.54inv2 # 200x200, SSD1681
     cs_pin: GPIO42
     dc_pin: GPIO8
     busy_pin: GPIO6
     reset_pin: GPIO7
-    # No reset_duration override: ESPHome's 200 ms default matches Waveshare's
-    # own driver. The 2 ms the community configs use starves the SSD1681's
-    # power-on reset and the panel never releases BUSY.
     rotation: 270°
     update_interval: never # updated from the sensor automation
-    # Was 1 (copied from the community config), which forced a full flashing
-    # refresh on every single update. The SSD1681 supports partial updates.
-    full_update_every: ${full_update_every}
+    full_update_interval: ${full_update_interval}
     lambda: |-
       // ---- top row: temperature | humidity ----
       if (id(temp).has_state())

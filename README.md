@@ -106,7 +106,7 @@ add `inverted: true` to the `led_power` switch, and swap the light for
 |---|---|---|
 | Wi-Fi | on; off again after 2 min without a network, retried every 30 min | **off** (`wifi.disable`) |
 | Sleep | never (`deep_sleep.prevent`) | deep sleep, wakes every `battery_sleep` (5 min) |
-| Display | refreshed every 30 s | refreshed once per wake |
+| Display | partial refresh every 30 s, full every 2 h | partial refresh once per wake, full every 2 h |
 | LED | CO2 traffic light | off |
 | Temp offset | 12.2 K with Wi-Fi connected, 4.4 K without | 0 K |
 | SCD4x between readings | measuring every 5 s | stopped (idle) during deep sleep |
@@ -127,6 +127,28 @@ expensive: 30 s costs roughly 4x the battery of 5 s. Screen layout:
 
 The status line is deliberately one `printf`. Drawing the label and the value as two
 separate left/right-aligned calls made them look mismatched in size on the panel.
+
+## E-paper driver
+
+`components/openco2_epaper` replaces ESPHome's `waveshare_epaper` for the panel.
+ESPHome's driver (model `1.54inv2`) resets the SSD1681 before every refresh and then
+writes only the new image. A partial refresh is computed per pixel from the
+controller's "previous" RAM (`0x26`) and "new" RAM (`0x24`), and with nothing valid
+in `0x26` it never erases what was on the glass — partial refreshes did not work,
+neither on the adapter nor on battery.
+
+This driver keeps the image that is on the panel in RTC slow memory, which survives
+deep sleep, and writes it to `0x26` before every partial refresh — the same idea as
+the stock firmware's `writePrevImage()`. Init sequence and waveforms (LUTs) are taken
+from the stock firmware; RAM addressing matches ESPHome's, so `rotation: 270°` still
+applies.
+
+- every refresh is partial (no flashing) except one full refresh per
+  `full_update_interval` (2 h), on the adapter and on battery alike. The interval
+  is timed with the RTC clock, which keeps running through deep sleep.
+- a cold boot (power switch, flashing) always starts with a full refresh, since
+  the panel contents are unknown then.
+- the `Display full refresh` button forces one in between if ghosting shows up.
 
 ## Temperature offset
 
