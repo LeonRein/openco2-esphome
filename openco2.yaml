@@ -77,7 +77,8 @@ esphome:
     then:
       - script.execute: apply_power_mode
   # Runs right before deep sleep (and before OTA/reboot). Only synchronous
-  # actions take effect here - delays and light transitions never run.
+  # actions take effect here: nothing after a delay runs, and light changes
+  # (written in the light's loop) never reach the LED.
   on_shutdown:
     then:
       # Stop the SCD4x's periodic measurement so it idles while the ESP
@@ -231,7 +232,11 @@ binary_sensor:
         input: true
         pullup: true
     on_press:
-      - component.update: epd
+      - if:
+          condition:
+            lambda: return id(co2).has_state();
+          then:
+            - component.update: epd
 
 sensor:
   - platform: scd4x
@@ -321,10 +326,10 @@ sensor:
     lambda: |-
       float v = id(batt_v).state;
       if (std::isnan(v)) return {};
-      if (v <= ${low_battery_volts}f) return 0.0f;
+      if (v <= (float) ${low_battery_volts}) return 0.0f;
       if (v >= 4.15f) return 100.0f;
       // Coarse LiPo curve: empty-3.70 V covers the bottom half.
-      if (v < 3.70f) return (v - ${low_battery_volts}f) / (3.70f - ${low_battery_volts}f) * 50.0f;
+      if (v < 3.70f) return (v - (float) ${low_battery_volts}) / (3.70f - (float) ${low_battery_volts}) * 50.0f;
       return 50.0f + (v - 3.70f) / 0.45f * 50.0f;
 
 text_sensor:
@@ -534,7 +539,12 @@ button:
     entity_category: config
     on_press:
       - lambda: id(epd).request_full_update();
-      - component.update: epd
+      # Before the first reading the flag just applies to the first draw.
+      - if:
+          condition:
+            lambda: return id(co2).has_state();
+          then:
+            - component.update: epd
 
   - platform: template
     name: Calibrate to 420 ppm
@@ -578,7 +588,7 @@ display:
     busy_pin: GPIO6
     reset_pin: GPIO7
     rotation: 270°
-    update_interval: never # updated from the sensor automation
+    update_interval: never # drawn by apply_power_mode, the 30 s interval, on_connect, buttons
     full_update_interval: ${full_update_interval}
     # Layout (200x200): status bar | CO2 value + ppm | CO2 scale | rating + RH.
     # No temperature: the SCD4x sits on the warm PCB and the reading cannot be
@@ -589,7 +599,7 @@ display:
 
       // ---- status bar ----
       // Same threshold as the 12 h park in apply_power_mode.
-      if (!id(usb_power).state && id(batt_v).state < ${low_battery_volts}f) {
+      if (!id(usb_power).state && id(batt_v).state <= (float) ${low_battery_volts}) {
         it.printf(W / 2, 0, id(font_small), TextAlign::TOP_CENTER, "BATTERY EMPTY");
       } else {
         // Measured before every first draw (apply_power_mode), so it is real.
