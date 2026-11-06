@@ -117,16 +117,18 @@ has to stay awake on battery waiting for its first reading, so a slow poll is
 expensive: 30 s costs roughly 4x the battery of 5 s. Screen layout:
 
 ```
- 21.6°C        48%rH
- ─────────────────────
-        2632
-         ppm
- ─────────────────────
- USB 49% 192.168.178.79     <- or "BAT 49% 3.69V" on battery
+ [▮▮  ] 96% USB      192.168.178.79   <- "18% BAT  3.52V" on battery
+ ──────────────────────────────────
+              2632
+              ppm
+ [██████████|███|█████|██████████]    <- 400..2000 ppm, ticks at 800/1000/1400
+ ▐LÜFTEN▌                  61 %rH     <- GUT / OK / MÄSSIG / LÜFTEN (inverted)
 ```
 
-The status line is deliberately one `printf`. Drawing the label and the value as two
-separate left/right-aligned calls made them look mismatched in size on the panel.
+There is no temperature on the display: the SCD4x sits on the same small board as
+the ESP32-S2, charger and LED, and its reading could not be compensated well enough
+to be useful. The `Temperature` entity is still published (the humidity correction
+uses it), but treat it as a board temperature.
 
 ## E-paper driver
 

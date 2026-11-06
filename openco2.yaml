@@ -530,7 +530,11 @@ font:
   - file: fonts/DejaVuSansCondensed-Bold.ttf
     id: font_med
     size: 26
-    glyphs: "0123456789.°C%rHpm"
+    glyphs: "GUTOKMÄSILÜFEN"
+  - file: fonts/DejaVuSansCondensed-Bold.ttf
+    id: font_label
+    size: 20
+    glyphs: "0123456789 %rHpm"
   - file: fonts/DejaVuSansCondensed.ttf
     id: font_small
     size: 14
@@ -553,32 +557,71 @@ display:
     rotation: 270°
     update_interval: never # updated from the sensor automation
     full_update_interval: ${full_update_interval}
+    # Layout (200x200): status bar | CO2 value + ppm | CO2 scale | rating + RH.
+    # No temperature: the SCD4x sits on the warm PCB and the reading cannot be
+    # compensated well enough to be useful (the HA entity is kept for RH).
     lambda: |-
-      // ---- top row: temperature | humidity ----
-      if (id(temp).has_state())
-        it.printf(2, 0, id(font_med), TextAlign::TOP_LEFT, "%.1f°C", id(temp).state);
-      if (id(rh).has_state())
-        it.printf(198, 0, id(font_med), TextAlign::TOP_RIGHT, "%.0f%%rH", id(rh).state);
-      it.line(0, 34, 200, 34);
+      const int W = 200, M = 4;  // width, common side margin
+      float co2v = id(co2).has_state() ? id(co2).state : NAN;
 
-      // ---- centre: CO2 ----
-      if (id(co2).has_state())
-        it.printf(100, 38, id(font_big), TextAlign::TOP_CENTER, "%.0f", id(co2).state);
-      else
-        it.printf(100, 38, id(font_big), TextAlign::TOP_CENTER, "---");
-      it.printf(100, 128, id(font_med), TextAlign::TOP_CENTER, "ppm");
-
-      // ---- bottom row: power source + battery ----
-      // Drawn as a SINGLE printf: two separate printf calls made the label and
-      // the value look mismatched in size/baseline on the panel.
-      it.line(0, 166, 200, 166);
-      float pct = id(batt_pct).has_state() ? id(batt_pct).state : 0.0f;
+      // ---- status bar ----
       if (id(low_battery)) {
-        it.printf(100, 172, id(font_small), TextAlign::TOP_CENTER, "BATTERY EMPTY");
-      } else if (id(usb_power).state) {
-        it.printf(2, 172, id(font_small), TextAlign::TOP_LEFT, "USB %.0f%% %s",
-                  pct, id(wifi_comp).is_connected() ? id(ip_addr).state.c_str() : "NO WI-FI");
+        it.printf(W / 2, 0, id(font_small), TextAlign::TOP_CENTER, "BATTERY EMPTY");
       } else {
-        it.printf(2, 172, id(font_small), TextAlign::TOP_LEFT, "BAT %.0f%% %.2fV",
-                  pct, id(batt_v).has_state() ? id(batt_v).state : 0.0f);
+        float pct = id(batt_pct).has_state() ? id(batt_pct).state : 0.0f;
+        // battery icon: 20x10 body + nub, filled by charge level
+        it.rectangle(M, 3, 20, 10);
+        it.filled_rectangle(M + 20, 6, 2, 4);
+        it.filled_rectangle(M + 2, 5, (int) roundf(16.0f * pct / 100.0f), 6);
+        const bool usb = id(usb_power).state;
+        it.printf(M + 26, 0, id(font_small), TextAlign::TOP_LEFT, "%.0f%% %s", pct, usb ? "USB" : "BAT");
+        if (usb)
+          it.printf(W - M, 0, id(font_small), TextAlign::TOP_RIGHT, "%s",
+                    id(wifi_comp).is_connected() ? id(ip_addr).state.c_str() : "NO WI-FI");
+        else if (id(batt_v).has_state())
+          it.printf(W - M, 0, id(font_small), TextAlign::TOP_RIGHT, "%.2fV", id(batt_v).state);
       }
+      it.horizontal_line(0, 18, W);
+
+      // ---- CO2 value ----
+      if (std::isnan(co2v))
+        it.printf(W / 2, 24, id(font_big), TextAlign::TOP_CENTER, "---");
+      else
+        it.printf(W / 2, 24, id(font_big), TextAlign::TOP_CENTER, "%.0f", co2v);
+      it.printf(W / 2, 100, id(font_label), TextAlign::TOP_CENTER, "ppm");
+
+      // ---- CO2 scale 400..2000 ppm, ticks at the rating thresholds ----
+      const int bx = M, by = 134, bw = W - 2 * M, bh = 12;
+      auto to_x = [&](float ppm) {
+        float f = (ppm - 400.0f) / 1600.0f;
+        f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+        return bx + (int) roundf(f * (bw - 1));
+      };
+      it.rectangle(bx, by, bw, bh);
+      if (!std::isnan(co2v))
+        it.filled_rectangle(bx, by, to_x(co2v) - bx + 1, bh);
+      for (float t : {800.0f, 1000.0f, 1400.0f}) {
+        int tx = to_x(t);
+        bool inside = !std::isnan(co2v) && co2v >= t;
+        it.vertical_line(tx, by - 3, 3);
+        it.vertical_line(tx, by + bh, 3);
+        it.vertical_line(tx, by + 2, bh - 4, inside ? COLOR_OFF : COLOR_ON);
+      }
+
+      // ---- rating | humidity, on one baseline ----
+      const int base = 191;
+      if (!std::isnan(co2v)) {
+        const char *rating = co2v < 800 ? "GUT" : co2v < 1000 ? "OK" : co2v < 1400 ? "MÄSSIG" : "LÜFTEN";
+        if (co2v >= 1400) {
+          // the one state that needs action: white on black, flush with the edge
+          const int pad = 6;
+          int x1, y1, tw, th;
+          it.get_text_bounds(pad, base, rating, id(font_med), TextAlign::BASELINE_LEFT, &x1, &y1, &tw, &th);
+          it.filled_rectangle(0, base - 26, x1 + tw + pad, 33);
+          it.printf(pad, base, id(font_med), COLOR_OFF, TextAlign::BASELINE_LEFT, "%s", rating);
+        } else {
+          it.printf(M, base, id(font_med), TextAlign::BASELINE_LEFT, "%s", rating);
+        }
+      }
+      if (id(rh).has_state())
+        it.printf(W - M, base, id(font_label), TextAlign::BASELINE_RIGHT, "%.0f %%rH", id(rh).state);
