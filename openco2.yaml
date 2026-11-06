@@ -370,11 +370,16 @@ light:
 interval:
   # The panel is only redrawn this often on the adapter; on battery the sensor
   # draws once per wake instead (see the humidity on_value above).
+  # ESPHome fires an interval's first run at a random point in the first half
+  # of the interval, i.e. often before the first CO2 reading after a wake -
+  # so skip until there is a value, or it would draw "---" over the last one.
   - interval: ${display_interval}
     then:
       - if:
           condition:
-            binary_sensor.is_on: usb_power
+            and:
+              - binary_sensor.is_on: usb_power
+              - lambda: return id(co2).has_state();
           then:
             - component.update: epd
 
