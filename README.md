@@ -189,9 +189,11 @@ hour (it needs that long to warm up / cool down). If it reads 1.5 K too high, ra
 that offset by 1.5. Values set there are stored on the device and take precedence
 over the `temp_offset_*` substitutions from then on.
 
-GPIO4 is both the `Power adapter` binary sensor and the ext1 deep-sleep wake source,
-so plugging in the adapter wakes the sensor immediately instead of waiting out the
-sleep interval. Unplugging it hands control back to deep sleep.
+GPIO4 is both the `Power adapter` binary sensor and the deep-sleep wake pin (ext0,
+level high — the same as the stock firmware), so plugging in the adapter wakes the
+sensor immediately instead of waiting out the sleep interval. The display switches
+to "USB" as soon as the first CO2 reading is in (~6 s after a wake), not at the next
+30 s refresh. Unplugging it hands control back to deep sleep.
 
 Below `low_battery_volts` (3.30 V) the sensor writes "BATTERY EMPTY" to the display —
 which an e-paper panel keeps showing with no power — and parks itself in 12 h sleeps

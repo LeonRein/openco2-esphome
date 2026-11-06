@@ -135,14 +135,16 @@ wifi:
 deep_sleep:
   id: sleeper
   sleep_duration: ${battery_sleep}
-  # Plugging in the power adapter pulls GPIO4 high and wakes the sensor at once.
-  # (ext1 keeps the RTC peripherals powered down, unlike a button/ext0 wake.)
-  esp32_ext1_wakeup:
-    pins:
-      - pin:
-          number: GPIO4
-          allow_other_uses: true # also read as a binary_sensor
-    mode: ANY_HIGH
+  # Plugging in the power adapter pulls GPIO4 high and wakes the sensor at
+  # once - a level interrupt on an RTC GPIO, active while the chip sleeps.
+  # ext0 on USB_PRESENT, level high, is exactly what the stock firmware uses
+  # (goto_deep_sleep: esp_sleep_enable_ext0_wakeup(USB_PRESENT, 1)); it keeps
+  # the RTC peripheral domain powered, a few uA next to the SCD4x's idle draw.
+  # KEEP_AWAKE: never go to sleep while the adapter is plugged in.
+  wakeup_pin:
+    number: GPIO4
+    allow_other_uses: true # also read as a binary_sensor
+  wakeup_pin_mode: KEEP_AWAKE
 
 globals:
   - id: low_battery
@@ -212,7 +214,7 @@ binary_sensor:
     name: Power adapter
     pin:
       number: GPIO4
-      allow_other_uses: true # also the ext1 deep-sleep wake source
+      allow_other_uses: true # also the deep-sleep wake pin (ext0)
     device_class: plug
     on_press:
       - script.execute: apply_power_mode
@@ -418,6 +420,14 @@ script:
                   switch.is_on: led_enabled
                 then:
                   - switch.turn_on: led_power
+            # Show "USB" right away instead of at the next 30 s tick. After a
+            # wake from deep sleep the first CO2 reading takes ~6 s, so wait
+            # for it rather than drawing "---".
+            - wait_until:
+                condition:
+                  lambda: return id(co2).has_state();
+                timeout: 15s
+            - component.update: epd
           else:
             - light.turn_off: led
             - delay: 50ms
