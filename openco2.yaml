@@ -77,6 +77,10 @@ esphome:
     # Decide battery vs. adapter behaviour once all pins have been read.
     - priority: -100
       then:
+        # Read the battery now: the 60 s poll would otherwise first run at a
+        # random point up to 30 s after boot, and the display would show no
+        # charge level until then (every wake from deep sleep is a boot).
+        - component.update: batt_v
         - script.execute: apply_power_mode
   on_shutdown:
     # Runs before deep sleep: park the LED cleanly, then cut its rail.
@@ -305,6 +309,9 @@ sensor:
     filters:
       - multiply: 2.0 # 1:2 divider on the board
     on_value:
+      # Derive the percentage from every new reading instead of on its own
+      # timer, so it is never behind the voltage.
+      - component.update: batt_pct
       # Charge limit, same hysteresis as the stock updateCharging(): it has
       # to read above 4.0 V a few times in a row before charging stops.
       - lambda: |-
@@ -340,7 +347,7 @@ sensor:
     unit_of_measurement: "%"
     device_class: battery
     accuracy_decimals: 0
-    update_interval: 60s
+    update_interval: never # recomputed on every batt_v reading
     lambda: |-
       float v = id(batt_v).state;
       if (std::isnan(v)) return {};
@@ -583,13 +590,19 @@ display:
       if (id(low_battery)) {
         it.printf(W / 2, 0, id(font_small), TextAlign::TOP_CENTER, "BATTERY EMPTY");
       } else {
-        float pct = id(batt_pct).has_state() ? id(batt_pct).state : 0.0f;
         // battery icon: 20x10 body + nub, filled by charge level
         it.rectangle(M, 3, 20, 10);
         it.filled_rectangle(M + 20, 6, 2, 4);
-        it.filled_rectangle(M + 2, 5, (int) roundf(16.0f * pct / 100.0f), 6);
         const bool usb = id(usb_power).state;
-        it.printf(M + 26, 0, id(font_small), TextAlign::TOP_LEFT, "%.0f%% %s", pct, usb ? "USB" : "BAT");
+        const char *src = usb ? "USB" : "BAT";
+        if (id(batt_pct).has_state()) {
+          float pct = id(batt_pct).state;
+          it.filled_rectangle(M + 2, 5, (int) roundf(16.0f * pct / 100.0f), 6);
+          it.printf(M + 26, 0, id(font_small), TextAlign::TOP_LEFT, "%.0f%% %s", pct, src);
+        } else {
+          // not measured yet - don't claim 0 %
+          it.printf(M + 26, 0, id(font_small), TextAlign::TOP_LEFT, "--%% %s", src);
+        }
         if (usb)
           it.printf(W - M, 0, id(font_small), TextAlign::TOP_RIGHT, "%s",
                     id(wifi_comp).is_connected() ? id(ip_addr).state.c_str() : "NO WI-FI");
