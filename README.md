@@ -5,21 +5,24 @@ by David Kreidler (ESP32-S2, Sensirion SCD4x, 1.54" 200x200 e-paper, WS2812 LED,
 
 It covers the three things this config was built for:
 
-- **the e-paper display works** — CO2, temperature, humidity, power source
+- **the e-paper display works** — CO2 with a rating and scale, humidity, battery and power source
 - **battery vs. power adapter is detected** (GPIO4) and changes behaviour
 - **it works with no Wi-Fi at all** — take it to the office, it just keeps measuring
 
 ## Tooling
 
-No virtualenv to manage; everything runs through [uv](https://docs.astral.sh/uv/) and
-always uses the newest ESPHome release:
+No virtualenv to manage; everything runs through [uv](https://docs.astral.sh/uv/) with
+a **pinned** ESPHome release:
 
 ```bash
-uvx esphome@latest config openco2.yaml
+uvx esphome@2026.10.2 config openco2.yaml
 ```
 
-`pyproject.toml` declares the (unpinned) dependency for anyone who prefers a project
-environment — `uv run -U esphome ...` works too.
+The version is pinned because `components/openco2_epaper` builds on ESPHome
+internals (`DisplayBuffer`, `do_update_`, `init_internal_`) that can change between
+releases. To upgrade, bump it in `pyproject.toml` and the commands here, rebuild and
+check the display. `pyproject.toml`/`uv.lock` declare the same version for anyone who
+prefers a project environment (`uv run esphome ...`).
 
 ## Before you flash: back up the stock firmware
 
@@ -49,7 +52,7 @@ download mode:
 
 ```bash
 cp secrets.yaml.example secrets.yaml   # then fill in your Wi-Fi
-uvx esphome@latest run openco2.yaml --device /dev/ttyACM0
+uvx esphome@2026.10.2 run openco2.yaml --device /dev/ttyACM0
 ```
 
 Use `run`, not `upload` — `upload` skips compilation and will happily flash a stale
@@ -59,7 +62,7 @@ In practice esptool resets this board into download mode by itself via RTS, so t
 button dance above is usually unnecessary. Once Wi-Fi works, update over the air:
 
 ```bash
-uvx esphome@latest run openco2.yaml --device openco2.local
+uvx esphome@2026.10.2 run openco2.yaml --device openco2.local
 ```
 
 ## Flashing a prebuilt image from a browser
@@ -105,16 +108,16 @@ add `inverted: true` to the `led_power` switch, and swap the light for
 | | Power adapter | Battery |
 |---|---|---|
 | Wi-Fi | on; off again after 2 min without a network, retried every 30 min | **off** (`wifi.disable`) |
-| Sleep | never (`deep_sleep.prevent`) | deep sleep, wakes every `battery_sleep` (5 min) |
+| Sleep | never (`wakeup_pin_mode: KEEP_AWAKE`) | deep sleep, wakes every `battery_sleep` (5 min) |
 | Display | partial refresh every 30 s, full every 2 h | partial refresh once per wake, full every 2 h |
 | LED | CO2 traffic light | off |
 | Temp offset | 12.2 K with Wi-Fi connected, 4.4 K without | 0 K |
 | SCD4x between readings | measuring every 5 s | stopped (idle) during deep sleep |
 | Charging | stops above 4.0 V, resumes below 3.9 V (stock default) | — |
 
-The SCD4x is polled every 5 s in both modes. That interval sets how long the sensor
-has to stay awake on battery waiting for its first reading, so a slow poll is
-expensive: 30 s costs roughly 4x the battery of 5 s. Screen layout:
+The SCD4x is polled every 5 s in both modes. On battery the first reading after a
+wake is what the ESP waits for before it can sleep again, so a slower poll keeps it
+awake longer. Screen layout:
 
 ```
  [▮▮  ] 96% USB      192.168.178.79   <- "18% BAT  3.52V" on battery
@@ -140,10 +143,11 @@ in `0x26` it never erases what was on the glass — partial refreshes did not wo
 neither on the adapter nor on battery.
 
 This driver keeps the image that is on the panel in RTC slow memory, which survives
-deep sleep, and writes it to `0x26` before every partial refresh — the same idea as
-the stock firmware's `writePrevImage()`. Init sequence and waveforms (LUTs) are taken
-from the stock firmware; RAM addressing matches ESPHome's, so `rotation: 270°` still
-applies.
+deep sleep, and writes it to `0x26` before every partial refresh, so only pixels that
+really change are driven. (The stock firmware's `writePrevImage()` after deep sleep
+writes the *inverted new* image there instead, which drives every pixel.) Command
+sequence and waveforms (LUTs) are the stock firmware's; RAM addressing matches
+ESPHome's driver, so `rotation: 270°` still applies, and the reset pulse is 200 ms.
 
 - every refresh is partial (no flashing) except one full refresh per
   `full_update_interval` (2 h), on the adapter and on battery alike. The interval
@@ -172,8 +176,8 @@ Those offsets were measured on hardware that behaved in specific ways, and this
 config now matches them:
 
 - **CPU at 80 MHz** (`esp32: cpu_frequency: 80MHZ`), like the stock build. ESPHome's
-  default for the S2 is 240 MHz, which heats the board noticeably more — the main
-  reason readings were too high before.
+  default for the S2 is 240 MHz, which heats the board more (and costs battery while
+  awake). It reduced, but did not fix, the too-high temperature readings.
 - **SCD4x stopped before deep sleep** on battery. Left in periodic mode it draws
   ~15 mA for the whole sleep and warms itself.
 - **Chip-side `temperature_offset: 0`**, all compensation in software. The SCD4x
@@ -189,15 +193,25 @@ hour (it needs that long to warm up / cool down). If it reads 1.5 K too high, ra
 that offset by 1.5. Values set there are stored on the device and take precedence
 over the `temp_offset_*` substitutions from then on.
 
-GPIO4 is both the `Power adapter` binary sensor and the deep-sleep wake pin (ext0,
-level high — the same as the stock firmware), so plugging in the adapter wakes the
-sensor immediately instead of waiting out the sleep interval. The display switches
-to "USB" as soon as the first CO2 reading is in (~6 s after a wake), not at the next
-30 s refresh. Unplugging it hands control back to deep sleep.
+## Plugging in and unplugging
 
-Below `low_battery_volts` (3.30 V) the sensor writes "BATTERY EMPTY" to the display —
-which an e-paper panel keeps showing with no power — and parks itself in 12 h sleeps
-until the adapter is connected.
+The whole battery/adapter behaviour lives in one script, `apply_power_mode`, which
+runs at boot (every wake from deep sleep is a boot) and on every change of GPIO4. It
+always measures the battery first, so the status bar never shows a stale charge level.
+
+- **Plugging in** wakes the sensor immediately: GPIO4 is both the `Power adapter`
+  binary sensor and the deep-sleep wake pin (ext0, level high — the same as the stock
+  firmware). The display switches to "USB" as soon as the first CO2 reading is in
+  (~6.5–11.5 s after a wake) and again once Wi-Fi has connected, to show the IP.
+- **Unplugging** redraws with the current values and goes to sleep right away.
+- **On battery** each wake waits for one complete reading, draws once and sleeps. If
+  the sensor delivers nothing within 30 s, it draws anyway ("---") and sleeps, rather
+  than draining the battery awake.
+
+Below `low_battery_volts` (3.30 V) on battery, the display shows "BATTERY EMPTY" —
+which an e-paper panel keeps showing with no power — and the sensor only wakes every
+12 h, or immediately when the adapter is plugged in. (The stock firmware parks at
+3.2 V with no timer at all.)
 
 ## Working without Wi-Fi
 
@@ -213,8 +227,11 @@ itself once back in range.
 ESPHome replaces the whole application, so these stock features go away: the menu
 button UI, the 24 h history graphs and QR export, the guided outdoor calibration,
 ventilation reminders, the captive-portal Wi-Fi setup and the USB-drive/OTA update
-paths. Stock battery life is quoted at up to 11 weeks; this config's 5-minute wake
-cycle is in the same ballpark but is not as finely tuned.
+paths. Stock battery life is quoted at up to 11 weeks. This config has not been
+measured; expect noticeably less: each 5-minute wake keeps the ESP awake for ~7–12 s
+waiting for a periodic SCD4x reading, and the SCD4x idles instead of being powered
+down between wakes, where the stock firmware uses single-shot readings and
+`powerDown()`.
 
 Worth knowing: the stock firmware already talks to Home Assistant over
 Prometheus/REST and has optional MQTT, so ESPHome is not required for the HA side —

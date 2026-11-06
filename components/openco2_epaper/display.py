@@ -15,7 +15,6 @@ from esphome.const import (
     CONF_DC_PIN,
     CONF_ID,
     CONF_LAMBDA,
-    CONF_PAGES,
     CONF_RESET_PIN,
 )
 
@@ -44,7 +43,7 @@ CONFIG_SCHEMA = cv.All(
     )
     .extend(cv.polling_component_schema("never"))
     .extend(spi.spi_device_schema()),
-    cv.has_at_most_one_key(CONF_PAGES, CONF_LAMBDA),
+    cv.only_on_esp32,  # RTC memory and esp_rtc_get_time_us()
 )
 
 FINAL_VALIDATE_SCHEMA = spi.final_validate_device_schema(

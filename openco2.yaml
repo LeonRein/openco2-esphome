@@ -33,7 +33,9 @@ substitutions:
   # Everything in between is a partial refresh. Lower it if ghosting builds
   # up; the "Display full refresh" button forces one in between.
   full_update_interval: 2h
-  low_battery_volts: "3.30" # below this the sensor parks itself to protect the cell
+  # Below this, on battery, the display shows "BATTERY EMPTY" and the sensor
+  # only wakes every 12 h (or when the adapter is plugged in) to spare the cell.
+  low_battery_volts: "3.30"
 
   # ---- Temperature compensation ------------------------------------------
   # The SCD4x sits on the same small board as the ESP32-S2, the charger and
@@ -70,26 +72,20 @@ esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
   on_boot:
-    # Bring the e-paper rail up before the display component talks to the panel.
-    - priority: 800
-      then:
-        - switch.turn_on: epd_power
-    # Decide battery vs. adapter behaviour once all pins have been read.
-    - priority: -100
-      then:
-        - script.execute: apply_power_mode
+    # Decide battery vs. adapter behaviour once everything is set up.
+    priority: -100
+    then:
+      - script.execute: apply_power_mode
+  # Runs right before deep sleep (and before OTA/reboot). Only synchronous
+  # actions take effect here - delays and light transitions never run.
   on_shutdown:
-    # Runs before deep sleep: park the LED cleanly, then cut its rail.
-    priority: 700
     then:
       # Stop the SCD4x's periodic measurement so it idles while the ESP
       # sleeps. Left running it draws ~15 mA for the whole 5 min and warms
       # itself, which the stock firmware avoids with single-shot readings
-      # (its battery offset is 0.0 only because of that). ESPHome restarts
-      # the measurement in its setup on the next wake.
+      # (its battery offset is 0.0 only because of that). ESPHome's scd4x has
+      # no stop action; its setup restarts the measurement on the next wake.
       - lambda: id(scd).write_command((uint16_t) 0x3f86);
-      - light.turn_off: led
-      - delay: 50ms
       - switch.turn_off: led_power
 
 esp32:
@@ -131,6 +127,16 @@ wifi:
   reboot_timeout: 0s
   power_save_mode: HIGH
   fast_connect: true
+  # The first draw after plugging in usually happens before Wi-Fi has
+  # associated; redraw so the status bar shows the IP instead of "NO WI-FI".
+  on_connect:
+    - if:
+        condition:
+          and:
+            - binary_sensor.is_on: usb_power
+            - lambda: return id(co2).has_state();
+        then:
+          - component.update: epd
 
 deep_sleep:
   id: sleeper
@@ -140,17 +146,12 @@ deep_sleep:
   # ext0 on USB_PRESENT, level high, is exactly what the stock firmware uses
   # (goto_deep_sleep: esp_sleep_enable_ext0_wakeup(USB_PRESENT, 1)); it keeps
   # the RTC peripheral domain powered, a few uA next to the SCD4x's idle draw.
-  # KEEP_AWAKE: never go to sleep while the adapter is plugged in.
+  # KEEP_AWAKE: a sleep requested while the adapter is plugged in is
+  # deferred instead (see apply_power_mode for how that is kept harmless).
   wakeup_pin:
     number: GPIO4
     allow_other_uses: true # also read as a binary_sensor
   wakeup_pin_mode: KEEP_AWAKE
-
-globals:
-  - id: low_battery
-    type: bool
-    restore_value: false
-    initial_value: "false"
 
 i2c:
   id: bus_a
@@ -177,16 +178,15 @@ switch:
     restore_mode: ALWAYS_OFF
     internal: true
 
-  # Stock firmware keeps the LED off on battery; this switch lets you override.
+  # CO2 traffic light on the adapter. On battery the LED is always off (it
+  # would be the biggest drain), as in the stock firmware's default.
   - platform: template
     id: led_enabled
     name: LED
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
     on_turn_off:
-      - light.turn_off: led
-      - delay: 50ms
-      - switch.turn_off: led_power
+      - script.execute: led_off
 
   - platform: gpio
     id: disable_charging
@@ -279,18 +279,6 @@ sensor:
             if (std::isnan(t_raw) || std::isnan(t)) return x;
             auto es = [](float c) { return std::exp(17.62f * c / (243.12f + c)); };
             return std::min(100.0f, std::max(0.0f, x * es(t_raw) / es(t)));
-      # Humidity is published last, so the whole set is fresh here.
-      on_value:
-        - if:
-            condition:
-              binary_sensor.is_off: usb_power
-            then:
-              # Battery: draw once and sleep straight away.
-              - component.update: epd
-              # The display driver blocks until the refresh is done, so
-              # only a short grace period is needed here.
-              - delay: 200ms
-              - deep_sleep.enter: sleeper
 
   - platform: adc
     id: batt_v
@@ -308,8 +296,8 @@ sensor:
       # Derive the percentage from every new reading instead of on its own
       # timer, so it is never behind the voltage.
       - component.update: batt_pct
-      # Charge limit, same hysteresis as the stock updateCharging(): it has
-      # to read above 4.0 V a few times in a row before charging stops.
+      # Charge limit like the stock updateCharging(): stop charging after 3
+      # readings in a row above 4.0 V (one per minute), resume below 3.9 V.
       - lambda: |-
           static int high_count = 0;
           if (!id(usb_power).state || !id(charge_limit).state) {
@@ -318,24 +306,10 @@ sensor:
           }
           if (x > 4.0f) {
             if (++high_count >= 3) id(disable_charging).turn_on();
-          } else if (x < 3.9f) {
+          } else {
             high_count = 0;
-            id(disable_charging).turn_off();
+            if (x < 3.9f) id(disable_charging).turn_off();
           }
-    on_value_range:
-      - below: ${low_battery_volts}
-        then:
-          - lambda: id(low_battery) = true;
-          - component.update: epd
-          - delay: 5s
-          - if:
-              condition:
-                binary_sensor.is_off: usb_power
-              then:
-                # Park for 12 h. Plugging in the adapter wakes it immediately.
-                - deep_sleep.enter:
-                    id: sleeper
-                    sleep_duration: 12h
 
   - platform: template
     id: batt_pct
@@ -347,10 +321,10 @@ sensor:
     lambda: |-
       float v = id(batt_v).state;
       if (std::isnan(v)) return {};
-      if (v <= 3.30f) return 0.0f;
+      if (v <= ${low_battery_volts}f) return 0.0f;
       if (v >= 4.15f) return 100.0f;
-      // Coarse LiPo curve: 3.30-3.70 V covers the bottom half.
-      if (v < 3.70f) return (v - 3.30f) / 0.40f * 50.0f;
+      // Coarse LiPo curve: empty-3.70 V covers the bottom half.
+      if (v < 3.70f) return (v - ${low_battery_volts}f) / (3.70f - ${low_battery_volts}f) * 50.0f;
       return 50.0f + (v - 3.70f) / 0.45f * 50.0f;
 
 text_sensor:
@@ -371,11 +345,10 @@ light:
     restore_mode: ALWAYS_OFF
 
 interval:
-  # The panel is only redrawn this often on the adapter; on battery the sensor
-  # draws once per wake instead (see the humidity on_value above).
-  # ESPHome fires an interval's first run at a random point in the first half
-  # of the interval, i.e. often before the first CO2 reading after a wake -
-  # so skip until there is a value, or it would draw "---" over the last one.
+  # The panel is only redrawn this often on the adapter; on battery it is
+  # drawn once per wake (apply_power_mode). ESPHome runs an interval's first
+  # iteration within 5 s of boot - before the first CO2 reading (~6.5-11.5 s
+  # after a wake) - so skip until there is a value, or it would draw "---".
   - interval: ${display_interval}
     then:
       - if:
@@ -413,18 +386,23 @@ interval:
             - script.execute: update_led
 
 script:
+  # The whole battery/adapter behaviour. Runs once at boot (every wake from
+  # deep sleep is a boot) and on every plug/unplug; `restart` means a plug or
+  # unplug cancels whatever the previous mode was still waiting for.
   - id: apply_power_mode
     mode: restart
     then:
-      # Measure the battery on every boot and every plug/unplug, before
-      # anything is drawn. The ADC read is synchronous and batt_pct is derived
-      # from it in batt_v's on_value, so both are current when the display
-      # draws (the 60 s poll alone would first run up to 30 s after boot).
+      # Measure the battery before anything is drawn. The ADC read is
+      # synchronous and batt_pct is derived from it in batt_v's on_value.
       - component.update: batt_v
       - if:
           condition:
             binary_sensor.is_on: usb_power
           then:
+            # Manual deep_sleep.enter ignores this; it blocks the sleep that
+            # KEEP_AWAKE defers when the adapter is plugged in mid-sleep, so
+            # that one can never fire later (e.g. right after unplugging).
+            # Never undone: on battery, sleep is always entered explicitly.
             - deep_sleep.prevent: sleeper
             - wifi.enable:
             - script.execute: wifi_give_up
@@ -434,19 +412,42 @@ script:
                 then:
                   - switch.turn_on: led_power
             # Show "USB" right away instead of at the next 30 s tick. After a
-            # wake from deep sleep the first CO2 reading takes ~6 s, so wait
-            # for it rather than drawing "---".
+            # wake the first CO2 reading takes ~6.5-11.5 s; wait for it rather
+            # than drawing "---". Only a sensor fault reaches the timeout.
             - wait_until:
                 condition:
                   lambda: return id(co2).has_state();
                 timeout: 15s
             - component.update: epd
           else:
-            - light.turn_off: led
-            - delay: 50ms
-            - switch.turn_off: led_power
+            - script.execute: led_off
             - wifi.disable:
-            - deep_sleep.allow: sleeper
+            # Battery cycle: wait for a complete reading (humidity is
+            # published last), draw once, sleep. Unplugged while running, the
+            # values are seconds old and this continues at once. If the sensor
+            # never delivers, the timeout still draws ("---") and sleeps
+            # instead of draining the battery awake.
+            - wait_until:
+                condition:
+                  lambda: return id(rh).has_state();
+                timeout: 30s
+            - component.update: epd # blocks until the panel has refreshed
+            - if:
+                condition:
+                  sensor.in_range:
+                    id: batt_v
+                    below: ${low_battery_volts}
+                then:
+                  - deep_sleep.enter:
+                      id: sleeper
+                      sleep_duration: 12h
+                else:
+                  - deep_sleep.enter: sleeper
+
+  - id: led_off
+    then:
+      - light.turn_off: led
+      - switch.turn_off: led_power
 
   # Switch the radio off again if no network shows up (e.g. at the office).
   - id: wifi_give_up
@@ -481,7 +482,6 @@ script:
           auto call = id(led).turn_on();
           call.set_rgb(red / 255.0f, green / 255.0f, blue / 255.0f);
           call.set_brightness(0.15f);   // stock default is dim
-          call.set_transition_length(0);
           call.perform();
 
 number:
@@ -568,8 +568,8 @@ display:
   # the panel before every refresh and then only writes the new image, so the
   # controller has no "previous" image to diff against and partial refreshes
   # leave the old content behind. This driver keeps the last image in RTC
-  # memory (survives deep sleep) and writes it back first, like the stock
-  # firmware's writePrevImage(). Init and waveforms are the stock firmware's.
+  # memory (survives deep sleep) and writes it to the controller's "previous
+  # image" RAM before every partial refresh. Waveforms are the stock firmware's.
   - platform: openco2_epaper
     id: epd
     spi_id: disp_spi
@@ -588,11 +588,11 @@ display:
       float co2v = id(co2).has_state() ? id(co2).state : NAN;
 
       // ---- status bar ----
-      if (id(low_battery)) {
+      // Same threshold as the 12 h park in apply_power_mode.
+      if (!id(usb_power).state && id(batt_v).state < ${low_battery_volts}f) {
         it.printf(W / 2, 0, id(font_small), TextAlign::TOP_CENTER, "BATTERY EMPTY");
       } else {
-        // Always measured before the first draw (apply_power_mode, on boot and
-        // on every plug/unplug), so this is a real reading.
+        // Measured before every first draw (apply_power_mode), so it is real.
         float pct = id(batt_pct).state;
         // battery icon: 20x10 body + nub, filled by charge level
         it.rectangle(M, 3, 20, 10);

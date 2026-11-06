@@ -4,6 +4,7 @@
 
 #include "esp_attr.h"
 #include "esp_rtc_time.h"
+#include "esphome/core/application.h"
 #include "esphome/core/log.h"
 
 namespace esphome::openco2_epaper {
@@ -47,12 +48,14 @@ static const uint8_t LUT_PARTIAL[159] = {
 };
 
 // The image currently on the panel, kept in RTC slow memory so it survives
-// deep sleep. A cold boot (power switch, flashing) clears the magic, which
-// forces a full refresh because the panel contents are unknown then.
+// deep sleep. rtc_magic is initialised data, so any boot other than a deep
+// sleep wake (power switch, flashing, reboot) resets it and forces a full
+// refresh - the panel contents are unknown then. The image itself is
+// no-init: only valid while the magic says so, and it costs no flash.
 static const uint32_t RTC_MAGIC = 0x0C02E1A1;
 static RTC_DATA_ATTR uint32_t rtc_magic = 0;
 static RTC_DATA_ATTR uint64_t rtc_last_full_us = 0;
-static RTC_DATA_ATTR uint8_t rtc_prev_image[OpenCO2EPaper::BUFFER_SIZE];
+static RTC_NOINIT_ATTR uint8_t rtc_prev_image[OpenCO2EPaper::BUFFER_SIZE];
 
 void OpenCO2EPaper::setup() {
   this->init_internal_(BUFFER_SIZE);
@@ -125,6 +128,9 @@ bool OpenCO2EPaper::wait_until_idle_(uint32_t timeout_ms) {
       ESP_LOGE(TAG, "Timeout waiting for the panel (BUSY stuck high)");
       return false;
     }
+    // A full refresh blocks for ~1.5 s; keep the task watchdog (5 s) fed so
+    // a stuck panel ends in the timeout above, not in a watchdog reset.
+    App.feed_wdt();
     delay(1);
   }
   return true;
@@ -218,6 +224,7 @@ void OpenCO2EPaper::update() {
   rtc_magic = 0;
 
   if (!this->init_panel_(full)) {
+    this->sleep_panel_();
     this->status_set_warning();
     return;
   }

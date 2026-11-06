@@ -3,8 +3,9 @@ name = "openco2-esphome"
 version = "0.1.0"
 description = "ESPHome firmware for the OpenCO2 Sensor (ESP32-S2, SCD4x, 1.54\" e-paper)"
 requires-python = ">=3.12,<3.14"
-# Intentionally unpinned: always build with the newest ESPHome.
-# Run tools via `uvx esphome@latest <cmd>`, or `uv run -U esphome <cmd>` to use this project env.
+# Pinned: components/openco2_epaper builds on ESPHome internals (DisplayBuffer,
+# do_update_, init_internal_), so bump this deliberately and rebuild/test.
+# Run tools via `uvx esphome@2026.10.2 <cmd>`, or `uv run esphome <cmd>` in this project env.
 dependencies = [
-    "esphome",
+    "esphome==2026.10.2",
 ]
